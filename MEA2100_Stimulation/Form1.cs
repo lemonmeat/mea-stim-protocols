@@ -36,13 +36,32 @@ namespace MEA2100_Stimulation
         private const double IntervalMinS = 2.0;       // random wait between the starts of consecutive trials, in [min, max]
         private const double IntervalMaxS = 4.0;
 
-        private const int AmplitudeUv = 1000;          // per phase; voltage mode, so 1 unit = 1 uV (McsUsbNet docs)
-        private const ulong PhaseUs = 300;             // duration of each phase of the biphasic pulse (negative first)
+        // Pulse amplitude per phase, in mV (voltage mode). Default: Kumar et al. 2026 used 1 V peak-to-peak
+        // biphasic pulses of 1 ms, i.e. +-500 mV and 500 us per phase. CONFIRM for your culture (an amplitude
+        // sweep, below, finds the lowest amplitude that evokes responses). The API itself counts in uV:
+        // the first random-site session used 1000, which is only +-1 mV.
+        private const double AmplitudeMv = 500;
+        private const double MaxAmplitudeMv = 1000;    // safety cap: refuse to start above this
+        private const ulong PhaseUs = 500;             // duration of each phase of the biphasic pulse (negative first)
         private const ulong TailUs = 1000;             // zero output after the pulse, before the trial's data ends
 
+        // Amplitude sweep: null = off. Otherwise every site gets PulsesPerSite pulses at each amplitude,
+        // lowest first, e.g. new double[] { 100, 250, 500, 1000 } with a few sites and PulsesPerSite = 10.
+        private static readonly double[] AmplitudeSweepMv = null;
+
+        // Hardware settings, applied to ALL electrodes at the start, so the recording behaves the same
+        // throughout. (The first session set them only on electrodes as they were first stimulated, so the
+        // artifact changed during the session and the one electrode never stimulated, 57, kept a large artifact.)
+        // Blanking holds the amplifier inputs during each pulse: fewer saturated channels, but the
+        // stimulated site no longer shows in the artifact. Turn it off for a session where the sites must be
+        // confirmed from the recording.
+        private static readonly bool HardwareBlanking = true;
+        private static readonly bool AmplifierProtection = true;
+        private const uint ElectrodeCount = 60;        // API electrode indices 0 .. ElectrodeCount - 1
+
         private static readonly int? FixedSeed = null; // null: a new seed each session (it is logged); set a number to repeat a schedule
-        private const string DeviceId = "E-00281";     // device the IndexToLabel table was made on
-        private const string ScriptVersion = "random-sites-1";
+        private const string DeviceId = "E-00278";     // device used; E-00278, E-00281 and E-00303 share the wiring
+        private const string ScriptVersion = "random-sites-2";
 
         // API electrode index -> MCS electrode label (measured on E-00281). Index 59 is not listed yet;
         // it is probably label 57, the only 60-electrode label missing here. Confirm before adding it.
@@ -71,6 +90,7 @@ namespace MEA2100_Stimulation
             public int Stg;          // 1 or 2
             public uint Electrode;   // API electrode index
             public double OffsetMs;  // start of the pulse relative to the trial start
+            public int AmplitudeUv;  // per phase, in uV as the API expects
         }
 
         private async void BtnStartClick(object sender, EventArgs e)
@@ -91,13 +111,15 @@ namespace MEA2100_Stimulation
             if (logPath == null)
                 return;
 
-            int nTrials = sites.Length * PulsesPerSite;
+            int nTrials = sites.Length * PulsesPerSite * Amplitudes().Length;
             double minutes = nTrials * (IntervalMinS + IntervalMaxS) / 2 / 60;
             var answer = MessageBox.Show(
                 "Is Multi Channel Experimenter already recording?\n\n" +
                 sites.Length + " sites, " + nTrials + " trials (" + (PairedTrials ? "paired" : "single") + "), about " +
                 minutes.ToString("F0", CultureInfo.InvariantCulture) + " min.\n\n" +
-                "Give the log the same base name as the recording.\nLog: " + logPath,
+                "Amplitude: " + string.Join(", ", Amplitudes().Select(a => a.ToString(CultureInfo.InvariantCulture))) + " mV per phase, " +
+                PhaseUs + " us phases; hardware blanking " + (HardwareBlanking ? "on" : "off") + ".\n\n" +
+                "Keep the .stimlog.csv and .notes.yaml together with the recording.\nLog: " + logPath,
                 "Start stimulation", MessageBoxButtons.YesNo);
             if (answer != DialogResult.Yes)
                 return;
@@ -141,9 +163,19 @@ namespace MEA2100_Stimulation
                     : "No sites to stimulate.");
             if (IntervalMaxS < IntervalMinS || Stg2DelayMaxMs < Stg2DelayMinMs)
                 throw new ArgumentException("A maximum is smaller than its minimum.");
+            foreach (double mv in Amplitudes())
+                if (mv <= 0 || mv > MaxAmplitudeMv)
+                    throw new ArgumentException("Amplitude " + mv.ToString(CultureInfo.InvariantCulture) + " mV is outside (0, " +
+                                                MaxAmplitudeMv.ToString(CultureInfo.InvariantCulture) + "] mV.");
             double trialMs = (PairedTrials ? Stg2DelayMaxMs : 0) + (2 * PhaseUs + TailUs) / 1000.0;
             if (IntervalMinS * 1000 < trialMs + 50)
                 throw new ArgumentException("IntervalMinS is shorter than one trial (" + trialMs.ToString("F0", CultureInfo.InvariantCulture) + " ms) plus 50 ms.");
+        }
+
+        // The amplitudes of this session, in mV: the sweep if set, else the one amplitude.
+        private static double[] Amplitudes()
+        {
+            return AmplitudeSweepMv != null ? AmplitudeSweepMv.OrderBy(a => a).ToArray() : new[] { AmplitudeMv };
         }
 
         private static string AskLogPath()
@@ -166,15 +198,17 @@ namespace MEA2100_Stimulation
         private static List<List<Pulse>> BuildSchedule(uint[] sites, Random rng)
         {
             var trials = new List<List<Pulse>>();
+            foreach (double mv in Amplitudes())
             for (int block = 0; block < PulsesPerSite; block++)
             {
+                int uv = (int)Math.Round(mv * 1000);
                 uint[] first = Shuffled(sites, rng);
                 if (!PairedTrials)
                 {
                     foreach (uint site in first)
                     {
                         int stg = trials.Count % 2 == 0 ? 1 : 2;   // alternate the two outputs
-                        trials.Add(new List<Pulse> { new Pulse { Stg = stg, Electrode = site, OffsetMs = 0 } });
+                        trials.Add(new List<Pulse> { new Pulse { Stg = stg, Electrode = site, OffsetMs = 0, AmplitudeUv = uv } });
                     }
                     continue;
                 }
@@ -186,8 +220,8 @@ namespace MEA2100_Stimulation
                     double delay = Stg2DelayMinMs + rng.NextDouble() * (Stg2DelayMaxMs - Stg2DelayMinMs);
                     trials.Add(new List<Pulse>
                     {
-                        new Pulse { Stg = 1, Electrode = first[i], OffsetMs = 0 },
-                        new Pulse { Stg = 2, Electrode = second[i], OffsetMs = delay },
+                        new Pulse { Stg = 1, Electrode = first[i], OffsetMs = 0, AmplitudeUv = uv },
+                        new Pulse { Stg = 2, Electrode = second[i], OffsetMs = delay, AmplitudeUv = uv },
                     });
                 }
             }
@@ -250,8 +284,7 @@ namespace MEA2100_Stimulation
                 {
                     cStgDevice.Connect(deviceEntry, 0);
                     cStgDevice.SetVoltageMode();
-                    foreach (uint site in sites)
-                        DisableElectrode(cStgDevice, site);   // start from a clean state
+                    SetUpAllElectrodes(cStgDevice);   // same hardware settings on every electrode, all switched off
 
                     int seq = 0;
                     double interval = 0;
@@ -275,7 +308,7 @@ namespace MEA2100_Stimulation
                                 p.Stg.ToString(CultureInfo.InvariantCulture),
                                 p.Electrode.ToString(CultureInfo.InvariantCulture),
                                 IndexToLabel[p.Electrode],
-                                AmplitudeUv.ToString(CultureInfo.InvariantCulture),
+                                p.AmplitudeUv.ToString(CultureInfo.InvariantCulture),
                                 "uV",
                                 PhaseUs.ToString(CultureInfo.InvariantCulture),
                                 p.OffsetMs.ToString("F3", CultureInfo.InvariantCulture),
@@ -300,8 +333,8 @@ namespace MEA2100_Stimulation
                 {
                     try
                     {
-                        foreach (uint site in sites)
-                            DisableElectrode(cStgDevice, site);
+                        for (uint e = 0; e < ElectrodeCount; e++)
+                            DisableElectrode(cStgDevice, e);
                     }
                     catch { }
                     try { cStgDevice.Disconnect(); } catch { }
@@ -331,7 +364,7 @@ namespace MEA2100_Stimulation
                     amplitude.Add(0);
                     duration.Add(delayUs);
                 }
-                amplitude.AddRange(new[] { -AmplitudeUv, AmplitudeUv, 0 });
+                amplitude.AddRange(new[] { -p.AmplitudeUv, p.AmplitudeUv, 0 });
                 duration.AddRange(new[] { PhaseUs, PhaseUs, TailUs });
                 SendChannel(cStgDevice, channel, amplitude.ToArray(), duration.ToArray());
                 channelMap |= 1u << (int)channel;
@@ -360,20 +393,27 @@ namespace MEA2100_Stimulation
             cStgDevice.PrepareAndSendData(stgChannel, sidebandData.Sideband, sidebandData.Duration, STG_DestinationEnumNet.syncoutdata);
         }
 
+        // Per trial: route the electrode to its STG output and switch it on. Mode, blanking and amplifier
+        // protection were set for every electrode at the start (SetUpAllElectrodes) and are not changed here.
         private void ConfigureElectrode(
             CStg200xDownloadNet cStgDevice,
             uint electrode,
             ElectrodeDacMuxEnumNet stgMux)
         {
-            cStgDevice.SetElectrodeModeHsOnIfb(electrode, ElectrodeModeEnumNet.emAutomatic);
+            cStgDevice.SetElectrodeDacMuxHsOnIfb(electrode, 0, stgMux);
 
-            cStgDevice.SetElectrodeDacMuxHsOnIfb(electrode,0,stgMux );
+            cStgDevice.SetElectrodeEnableHsOnIfb(electrode, 0, true);
+        }
 
-            cStgDevice.SetElectrodeEnableHsOnIfb(electrode,0,true);
-
-            cStgDevice.SetBlankingEnableHsOnIfb(electrode,true);
-
-            cStgDevice.SetEnableAmplifierProtectionSwitchHsOnIfb(electrode,true);
+        private static void SetUpAllElectrodes(CStg200xDownloadNet cStgDevice)
+        {
+            for (uint e = 0; e < ElectrodeCount; e++)
+            {
+                cStgDevice.SetElectrodeModeHsOnIfb(e, ElectrodeModeEnumNet.emAutomatic);
+                cStgDevice.SetBlankingEnableHsOnIfb(e, HardwareBlanking);
+                cStgDevice.SetEnableAmplifierProtectionSwitchHsOnIfb(e, AmplifierProtection);
+                cStgDevice.SetElectrodeEnableHsOnIfb(e, 0, false);
+            }
         }
 
         private static void DisableElectrode(CStg200xDownloadNet cStgDevice, uint electrode)
@@ -394,8 +434,10 @@ namespace MEA2100_Stimulation
             sb.AppendLine("started: " + DateTime.Now.ToString("yyyy-MM-ddTHH:mm:ss", inv));
             sb.AppendLine("seed: " + seed.ToString(inv));
             sb.AppendLine("mode: " + (PairedTrials ? "paired" : "single"));
-            sb.AppendLine("stimulation: {mode: voltage, amplitude: " + AmplitudeUv.ToString(inv) + ", unit: uV, phase_us: " +
-                          PhaseUs.ToString(inv) + ", shape: biphasic negative-first}");
+            sb.AppendLine("stimulation: {mode: voltage, amplitude_mv: [" + string.Join(", ", Amplitudes().Select(a => a.ToString(inv))) +
+                          "], phase_us: " + PhaseUs.ToString(inv) + ", shape: biphasic negative-first}");
+            sb.AppendLine("hardware_blanking: " + (HardwareBlanking ? "true" : "false"));
+            sb.AppendLine("amplifier_protection: " + (AmplifierProtection ? "true" : "false"));
             sb.AppendLine("interval_s: [" + IntervalMinS.ToString(inv) + ", " + IntervalMaxS.ToString(inv) + "]");
             if (PairedTrials)
                 sb.AppendLine("stg2_delay_ms: [" + Stg2DelayMinMs.ToString(inv) + ", " + Stg2DelayMaxMs.ToString(inv) + "]");

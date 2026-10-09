@@ -9,8 +9,10 @@ Stimulation scripts for recording sessions on the MCS MEA2100-Mini with the 3D-M
 1. Edit the settings block at the top of `Form1.cs`:
    - `SiteLabels`: electrode labels to stimulate (null = all except `ExcludedLabels`);
    - `PulsesPerSite`, `PairedTrials`, `IntervalMinS`/`IntervalMaxS`;
-   - `AmplitudeUv`, `PhaseUs`;
-   - `FixedSeed`.
+   - `AmplitudeMv` (per phase, in **mV**; capped by `MaxAmplitudeMv`), `PhaseUs`;
+   - `AmplitudeSweepMv` (optional: test several amplitudes, lowest first);
+   - `HardwareBlanking`, `AmplifierProtection` (applied to all 60 electrodes at the start);
+   - `FixedSeed`, `DeviceId`.
 2. Start recording in Multi Channel Experimenter.
 3. Click **Start Stimulation**, save the log under the recording's base name, and confirm. The dialog shows the number of trials and the estimated duration.
 4. **Stop Stimulation** ends the session early. The log and notes stay valid up to the last trial sent.
@@ -18,6 +20,8 @@ Stimulation scripts for recording sessions on the MCS MEA2100-Mini with the 3D-M
 **Modes:**
 - **Single** (default): one electrode per trial, alternating STG 1 and STG 2.
 - **Paired:** STG 1 and STG 2 stimulate two different electrodes in the same trial, STG 2 after a random 100–300 ms delay. The script never puts the same electrode on both outputs in one trial.
+
+**Amplitude sweep:** with `AmplitudeSweepMv = new double[] { 100, 250, 500, 1000 }`, a few `SiteLabels` and a small `PulsesPerSite`, every site is stimulated at each amplitude, lowest first. Use it to find the lowest amplitude that evokes responses without saturating the array.
 
 **Schedule:** every site is used once per block, in a new random order each block, so all sites get the same number of pulses. Before each trial, the previous trial's electrodes are switched off, so only the logged electrodes are stimulated.
 
@@ -48,7 +52,7 @@ C# script (McsUsbNet)            Multi Channel Experimenter
 
 ## Files each session must produce
 
-The analysis package (`meagraph`, in the ECE 398 (IW) project) will read these files. Treat this format as the contract between the two.
+The analysis package (`meagraph`, in the ECE 398 (IW) project) reads these files (`meagraph.io.stimlog`; format also in its `docs/DATA_FORMAT.md`). Treat this format as the contract between the two.
 
 **`<recording>.stimlog.csv`**: one row per pulse, written and flushed as each pulse is sent.
 
@@ -93,7 +97,11 @@ Choose an amplitude that evokes responses **without saturating the whole array**
 - **Pulse counts.** After each session, the number of log rows per STG output must equal the number of `Single Pulse Start` events for that output in the `.h5`.
 - **Site inside the recording (optional test).** Every recording has empty `STG 1/2 Marker Start/Stop` event entries. Test whether sync-out pulses sent from the API (`syncoutdata`) are recorded there. If they are, a marker's duration could encode the electrode index, so the `.h5` carries its own sites.
 - **Index table.** `IndexToLabel` lists indices 0–58. Label 57 is missing (probably index 59) and label 15 is included. 15 is the reference electrode on E-00303, so it is excluded from random sites by default. Confirm index 59 before adding it.
-- **Amplitude.** The API counts voltage in µV, so the current `AmplitudeUv = 1000` means ±1 mV phases (Kumar et al. 2026 used 1 V peak-to-peak). Check that this is intended.
+- **Amplitude.** The API counts voltage in µV. The first session (2026-10-08) sent 1000, which is only ±1 mV. The setting is now `AmplitudeMv`. Its default of ±500 mV with 500 µs phases follows Kumar et al. 2026 (1 V peak-to-peak, 1 ms). Confirm it, or find your own with an amplitude sweep.
+- **Hardware settings on all electrodes (fixed in random-sites-2).** The first version set hardware blanking and amplifier protection only on an electrode when it was first stimulated. In the 2026-10-08 recording, each electrode's artifact fell from about 2.3 mV to 0.02 mV once it had been used. Electrode 57 (index 59, which is not in the table) was never set up, so it kept a large artifact on every pulse. All 60 electrodes are now set up identically before the first pulse.
+- **Blanking hides the site.** With `HardwareBlanking = true`, the stimulated electrode does not stand out in the recording, so `meagraph audit` cannot confirm the logged sites. Run one session with it off to verify the index → label table, if the array does not saturate.
+- **Keep the notes file.** Copy `<name>.notes.yaml` along with `<name>.stimlog.csv` into the recording's folder. The first session's notes were not copied.
+- **Sampling rate.** The first session was recorded at 10 kHz. 20 kHz is set in Multi Channel Experimenter, not here.
 - **Device ID.** The index → label table was made on `E-00281`; recordings so far are from `E-00303`. The electrode → (row, col, layer) map in meagraph belongs to E-00303. Confirm the two devices are folded and wired identically before using E-00281 data.
 
 ## References
