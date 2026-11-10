@@ -13,84 +13,117 @@ using System.Windows.Forms;
 
 namespace MEA2100_Stimulation
 {
-    // Random-site, random-timing stimulation with a per-pulse log (see README.md).
+    // Random-site, random-timing stimulation with custom waveforms, a per-pulse log, and (optionally)
+    // its own recording straight to HDF5 (see README.md).
     //
     // Each trial stimulates one electrode (single mode, STG 1 and STG 2 alternating) or two different
-    // electrodes (paired mode, STG 1 then STG 2 after a random delay). Sites come from a balanced
-    // schedule: every site is used once per block, in a new random order each block. Trials are
-    // separated by random intervals. Every pulse is written to <name>.stimlog.csv as it is sent, so the
-    // k-th logged pulse on an STG output matches the k-th "STG n Single Pulse Start" event that
-    // Multi Channel Experimenter records.
+    // electrodes (paired mode, STG 1 then STG 2 after a random delay) with one of the Waveforms. Sites
+    // and waveforms come from a balanced schedule (Schedule.cs). Trials are separated by random
+    // intervals. Every pulse is written to <name>.stimlog.csv as it is sent, so the k-th logged pulse
+    // on an STG output matches the k-th "STG n Single Pulse Start" event of the recording.
+    //
+    // With RecordToH5 the program records the session itself to <name>.h5 (Recorder.cs); Multi Channel
+    // Experimenter must then be closed. Without it, Experimenter records as before.
     public partial class Form1 : Form
     {
         // ---------------- Session settings: edit before each session ----------------
 
-        // Sites to stimulate, as MCS electrode labels. null = every label in IndexToLabel except ExcludedLabels.
-        private static readonly string[] SiteLabels = null;   // e.g. new[] { "47", "12", "33", "78" }
-        private static readonly string[] ExcludedLabels = { "15" };   // 15 is the reference electrode on E-00303
+        // false: record only (spontaneous activity) for SpontaneousMinutes; needs RecordToH5.
+        private static readonly bool StimulationEnabled = true;
 
-        private const int PulsesPerSite = 50;          // single mode: pulses per site; paired mode: per site and per STG output
+        // Sites to stimulate, as MCS electrode labels. null = every electrode except ExcludedLabels.
+        private static readonly string[] SiteLabels = null;   // e.g. new[] { "47", "12", "33", "78" }
+        private static readonly string[] ExcludedLabels = { "15" };   // 15 is the reference electrode
+
+        // Waveforms to test. Every site gets TrialsPerCondition trials of each waveform at each amplitude,
+        // interleaved in random order. Levels are fractions of the amplitude; see Waveform.cs for the
+        // builders (Biphasic, Monophasic, Asymmetric, Custom, .Train). Examples:
+        //     Waveform.Biphasic("bi500pos", 500, negativeFirst: false),
+        //     Waveform.Biphasic("bi200gap", 200, gapUs: 100),
+        //     Waveform.Asymmetric("asym200x4", 200, ratio: 4),
+        //     Waveform.Custom("tri", new[] { -1, 0.5, 0.5 }, new ulong[] { 200, 200, 200 }),
+        //     Waveform.Biphasic("bi200", 200).Train(3, 100),      // 3 pulses at 100 Hz
+        // Default: the pulse used so far, negative first, 500 us per phase (Kumar et al. 2026: 1 ms, 1 V
+        // peak to peak). Waveforms that are not charge-balanced are allowed but named in the start dialog.
+        private static readonly Waveform[] Waveforms =
+        {
+            Waveform.Biphasic("bi500", 500),
+        };
+
+        private const int TrialsPerCondition = 50;     // trials per site, per waveform and per amplitude (per STG output too in paired mode)
         private static readonly bool PairedTrials = false;   // false: one site per trial; true: STG 1 and STG 2 on two different sites
-        private const double Stg2DelayMinMs = 100;     // paired mode: STG 2 pulse starts this long after STG 1 (random in [min, max])
+        private const double Stg2DelayMinMs = 100;     // paired mode: STG 2 starts this long after STG 1 (random in [min, max])
         private const double Stg2DelayMaxMs = 300;
         private const double IntervalMinS = 2.0;       // random wait between the starts of consecutive trials, in [min, max]
         private const double IntervalMaxS = 4.0;
 
-        // Pulse amplitude per phase, in mV (voltage mode). Default: Kumar et al. 2026 used 1 V peak-to-peak
-        // biphasic pulses of 1 ms, i.e. +-500 mV and 500 us per phase. CONFIRM for your culture (an amplitude
-        // sweep, below, finds the lowest amplitude that evokes responses). The API itself counts in uV:
-        // the first random-site session used 1000, which is only +-1 mV.
+        // Amplitude that a waveform level of 1 stands for, in mV (voltage mode). CONFIRM for your culture
+        // (an amplitude sweep, below, finds the lowest amplitude that evokes responses). The API itself
+        // counts in uV: the first random-site session used 1000, which is only +-1 mV.
         private const double AmplitudeMv = 500;
         private const double MaxAmplitudeMv = 1000;    // safety cap: refuse to start above this
-        private const ulong PhaseUs = 500;             // duration of each phase of the biphasic pulse (negative first)
-        private const ulong TailUs = 1000;             // zero output after the pulse, before the trial's data ends
+        private const ulong TailUs = 1000;             // zero output after the last pulse, before the trial's data ends
 
-        // Amplitude sweep: null = off. Otherwise every site gets PulsesPerSite pulses at each amplitude,
-        // lowest first, e.g. new double[] { 100, 250, 500, 1000 } with a few sites and PulsesPerSite = 10.
+        // Amplitude sweep: null = off. Otherwise every condition is run at each amplitude, lowest first,
+        // e.g. new double[] { 100, 250, 500, 1000 } with a few sites and TrialsPerCondition = 10.
         private static readonly double[] AmplitudeSweepMv = null;
 
         // Hardware settings, applied to ALL electrodes at the start, so the recording behaves the same
-        // throughout. (The first session set them only on electrodes as they were first stimulated, so the
-        // artifact changed during the session and the one electrode never stimulated, 57, kept a large artifact.)
-        // Blanking holds the amplifier inputs during each pulse: fewer saturated channels, but the
-        // stimulated site no longer shows in the artifact. Turn it off for a session where the sites must be
-        // confirmed from the recording.
+        // throughout. Blanking holds the amplifier inputs during each pulse: fewer saturated channels, but
+        // the stimulated site no longer shows in the artifact. Turn it off for a session where the sites
+        // must be confirmed from the recording.
         private static readonly bool HardwareBlanking = true;
         private static readonly bool AmplifierProtection = true;
-        private const uint ElectrodeCount = 60;        // API electrode indices 0 .. ElectrodeCount - 1
+
+        // Recording straight to <name>.h5. Close Multi Channel Experimenter first. With false, nothing is
+        // recorded here and Experimenter must record, as before.
+        private static readonly bool RecordToH5 = true;
+        private const int SamplingRateHz = 20000;
+        private const double PreStimS = 60;            // recorded before the first trial
+        private const double PostStimS = 60;           // recorded after the last trial
+        private const double SpontaneousMinutes = 30;  // length of a recording without stimulation
+        private const int H5GzipLevel = 1;             // 0 = no compression (larger files, least CPU)
 
         private static readonly int? FixedSeed = null; // null: a new seed each session (it is logged); set a number to repeat a schedule
         private const string DeviceId = "E-00278";     // device used; E-00278, E-00281 and E-00303 share the wiring
-        private const string ScriptVersion = "random-sites-2";
-
-        // API electrode index -> MCS electrode label (measured on E-00281). Index 59 is not listed yet;
-        // it is probably label 57, the only 60-electrode label missing here. Confirm before adding it.
-        private static readonly string[] IndexToLabel =
-        {
-            "47", "48", "46", "45", "38", "37", "28", "36", "27", "17",
-            "26", "16", "35", "25", "15", "14", "24", "34", "13", "23",
-            "12", "22", "33", "21", "32", "31", "44", "43", "41", "42",
-            "52", "51", "53", "54", "61", "62", "71", "63", "72", "82",
-            "73", "83", "64", "74", "84", "85", "75", "65", "86", "76",
-            "87", "77", "66", "78", "67", "68", "55", "56", "58",
-        };
+        private const string ScriptVersion = "waveforms-h5-1";
 
         // -----------------------------------------------------------------------------
 
+        private static readonly string[] IndexToLabel = ElectrodeMap.IndexToLabel;
+        private static readonly uint ElectrodeCount = (uint)ElectrodeMap.IndexToLabel.Length;   // API electrode indices 0 .. ElectrodeCount - 1
+
         private CancellationTokenSource stimCancelToken;
+        private readonly System.Windows.Forms.Timer statusTimer = new System.Windows.Forms.Timer { Interval = 500 };
+        private volatile string status = "";
+        private volatile Recorder activeRecorder;
+        private bool sessionRunning, closeWhenDone;
 
         public Form1()
         {
             InitializeComponent();
+            btnStart.Text = StimulationEnabled ? (RecordToH5 ? "Start Recording + Stimulation" : "Start Stimulation") : "Start Recording";
+            button1.Text = "Stop";
+            statusTimer.Tick += (s, e) => ShowStatus();
+            FormClosing += (s, e) =>
+            {
+                if (!sessionRunning)
+                    return;
+                e.Cancel = true;            // finish the files first, then close
+                closeWhenDone = true;
+                stimCancelToken?.Cancel();
+            };
         }
 
-        // One stimulation pulse of a trial.
-        private class Pulse
+        private void ShowStatus()
         {
-            public int Stg;          // 1 or 2
-            public uint Electrode;   // API electrode index
-            public double OffsetMs;  // start of the pulse relative to the trial start
-            public int AmplitudeUv;  // per phase, in uV as the API expects
+            Recorder r = activeRecorder;
+            string text = status;
+            if (r != null)
+                text += "\nRecorded " + r.RecordedS.ToString("F0", CultureInfo.InvariantCulture) + " s" +
+                        (r.QueuedBlocks > 20 ? "; disk is behind by " + (r.QueuedBlocks / 10.0).ToString("F0", CultureInfo.InvariantCulture) + " s" : "") +
+                        (r.ErrorCount > 0 ? "; " + r.ErrorCount + " device errors" : "");
+            lblStatus.Text = text;
         }
 
         private async void BtnStartClick(object sender, EventArgs e)
@@ -98,7 +131,7 @@ namespace MEA2100_Stimulation
             uint[] sites;
             try
             {
-                sites = ResolveSites();
+                sites = StimulationEnabled ? ResolveSites() : new uint[0];
                 CheckSettings(sites);
             }
             catch (Exception ex)
@@ -107,31 +140,51 @@ namespace MEA2100_Stimulation
                 return;
             }
 
-            string logPath = AskLogPath();
-            if (logPath == null)
+            string basePath = AskBasePath();
+            if (basePath == null)
                 return;
+            if (RecordToH5 && File.Exists(basePath + ".h5"))
+            {
+                MessageBox.Show(basePath + ".h5 already exists. Recordings are never overwritten: choose another name.");
+                return;
+            }
 
-            int nTrials = sites.Length * PulsesPerSite * Amplitudes().Length;
-            double minutes = nTrials * (IntervalMinS + IntervalMaxS) / 2 / 60;
-            var answer = MessageBox.Show(
-                "Is Multi Channel Experimenter already recording?\n\n" +
-                sites.Length + " sites, " + nTrials + " trials (" + (PairedTrials ? "paired" : "single") + "), about " +
-                minutes.ToString("F0", CultureInfo.InvariantCulture) + " min.\n\n" +
-                "Amplitude: " + string.Join(", ", Amplitudes().Select(a => a.ToString(CultureInfo.InvariantCulture))) + " mV per phase, " +
-                PhaseUs + " us phases; hardware blanking " + (HardwareBlanking ? "on" : "off") + ".\n\n" +
-                "Keep the .stimlog.csv and .notes.yaml together with the recording.\nLog: " + logPath,
-                "Start stimulation", MessageBoxButtons.YesNo);
-            if (answer != DialogResult.Yes)
+            var inv = CultureInfo.InvariantCulture;
+            int nTrials = sites.Length * TrialsPerCondition * Amplitudes().Length * Waveforms.Length;
+            double minutes = StimulationEnabled
+                ? nTrials * (IntervalMinS + IntervalMaxS) / 2 / 60 + (RecordToH5 ? (PreStimS + PostStimS) / 60 : 0)
+                : SpontaneousMinutes;
+            string unbalanced = string.Join(", ", Waveforms.Where(w => !w.IsChargeBalanced).Select(w => w.Name));
+            string text =
+                (RecordToH5 ? "Multi Channel Experimenter must be CLOSED: this program records to\n" + basePath + ".h5 at " + SamplingRateHz + " Hz.\n\n"
+                            : "Is Multi Channel Experimenter already recording?\n\n") +
+                (StimulationEnabled
+                    ? sites.Length + " sites x " + Waveforms.Length + " waveforms (" + string.Join(", ", Waveforms.Select(w => w.Name)) + ") x " +
+                      Amplitudes().Length + " amplitudes x " + TrialsPerCondition + " = " + nTrials + " trials (" + (PairedTrials ? "paired" : "single") + ").\n" +
+                      "Amplitude: " + string.Join(", ", Amplitudes().Select(a => a.ToString(inv))) + " mV; hardware blanking " + (HardwareBlanking ? "on" : "off") + ".\n" +
+                      (unbalanced.Length > 0 ? "NOT charge-balanced: " + unbalanced + ".\n" : "")
+                    : "No stimulation.\n") +
+                "About " + minutes.ToString("F0", inv) + " min.\n\n" +
+                "Keep all files named " + Path.GetFileName(basePath) + ".* together.";
+            if (MessageBox.Show(text, "Start session", MessageBoxButtons.YesNo) != DialogResult.Yes)
                 return;
 
             stimCancelToken = new CancellationTokenSource();
             CancellationToken token = stimCancelToken.Token;
             btnStart.Enabled = false;
+            sessionRunning = true;
+            statusTimer.Start();
 
-            string summary = await Task.Run(() => RunSession(sites, logPath, token));
+            string summary = await Task.Run(() => RunSession(sites, basePath, token));
 
+            statusTimer.Stop();
+            sessionRunning = false;
+            status = "";
+            ShowStatus();
             btnStart.Enabled = true;
             MessageBox.Show(summary);
+            if (closeWhenDone)
+                Close();
         }
 
         private void button1_Click(object sender, EventArgs e)
@@ -157,19 +210,29 @@ namespace MEA2100_Stimulation
 
         private static void CheckSettings(uint[] sites)
         {
+            var inv = CultureInfo.InvariantCulture;
+            if (!StimulationEnabled)
+            {
+                if (!RecordToH5)
+                    throw new ArgumentException("StimulationEnabled and RecordToH5 are both false: nothing to do.");
+                return;
+            }
             if (sites.Length < (PairedTrials ? 3 : 1))
                 throw new ArgumentException(PairedTrials
                     ? "Paired trials need at least 3 sites, so STG 1 and STG 2 never get the same electrode."
                     : "No sites to stimulate.");
+            if (Waveforms.Length == 0)
+                throw new ArgumentException("Waveforms is empty.");
+            if (Waveforms.Select(w => w.Name).Distinct().Count() != Waveforms.Length)
+                throw new ArgumentException("Two waveforms have the same name.");
             if (IntervalMaxS < IntervalMinS || Stg2DelayMaxMs < Stg2DelayMinMs)
                 throw new ArgumentException("A maximum is smaller than its minimum.");
             foreach (double mv in Amplitudes())
                 if (mv <= 0 || mv > MaxAmplitudeMv)
-                    throw new ArgumentException("Amplitude " + mv.ToString(CultureInfo.InvariantCulture) + " mV is outside (0, " +
-                                                MaxAmplitudeMv.ToString(CultureInfo.InvariantCulture) + "] mV.");
-            double trialMs = (PairedTrials ? Stg2DelayMaxMs : 0) + (2 * PhaseUs + TailUs) / 1000.0;
+                    throw new ArgumentException("Amplitude " + mv.ToString(inv) + " mV is outside (0, " + MaxAmplitudeMv.ToString(inv) + "] mV.");
+            double trialMs = (PairedTrials ? Stg2DelayMaxMs : 0) + (Waveforms.Max(w => w.TotalUs) + TailUs) / 1000.0;
             if (IntervalMinS * 1000 < trialMs + 50)
-                throw new ArgumentException("IntervalMinS is shorter than one trial (" + trialMs.ToString("F0", CultureInfo.InvariantCulture) + " ms) plus 50 ms.");
+                throw new ArgumentException("IntervalMinS is shorter than the longest trial (" + trialMs.ToString("F0", inv) + " ms) plus 50 ms.");
         }
 
         // The amplitudes of this session, in mV: the sweep if set, else the one amplitude.
@@ -178,118 +241,103 @@ namespace MEA2100_Stimulation
             return AmplitudeSweepMv != null ? AmplitudeSweepMv.OrderBy(a => a).ToArray() : new[] { AmplitudeMv };
         }
 
-        private static string AskLogPath()
+        // Where the session's files go: the path without extension (<base>.h5, .stimlog.csv, .notes.yaml).
+        private static string AskBasePath()
         {
             using (var dialog = new SaveFileDialog())
             {
-                dialog.Title = "Stimulation log (use the recording's base name)";
-                dialog.Filter = "Stimulation log (*.stimlog.csv)|*.stimlog.csv";
-                dialog.FileName = DateTime.Now.ToString("yyyy-MM-ddTHH-mm-ss", CultureInfo.InvariantCulture) + ".stimlog.csv";
+                dialog.Title = RecordToH5 ? "Session name (recording, log and notes)" : "Session name (use the recording's base name)";
+                dialog.Filter = "Session (name without extension)|*.*";
+                dialog.OverwritePrompt = false;
+                dialog.FileName = DateTime.Now.ToString("yyyy-MM-ddTHH-mm-ss", CultureInfo.InvariantCulture);
                 if (dialog.ShowDialog() != DialogResult.OK)
                     return null;
                 string path = dialog.FileName;
-                if (!path.EndsWith(".stimlog.csv", StringComparison.OrdinalIgnoreCase))
-                    path = Path.ChangeExtension(path, null) + ".stimlog.csv";
+                foreach (string ext in new[] { ".stimlog.csv", ".notes.yaml", ".h5" })
+                    if (path.EndsWith(ext, StringComparison.OrdinalIgnoreCase))
+                        path = path.Substring(0, path.Length - ext.Length);
                 return path;
             }
         }
 
-        // Balanced, shuffled schedule: list of trials, each a list of pulses.
-        private static List<List<Pulse>> BuildSchedule(uint[] sites, Random rng)
+        // Wait on the PC clock; false if the user stopped the session.
+        private static bool Wait(double seconds, CancellationToken token)
         {
-            var trials = new List<List<Pulse>>();
-            foreach (double mv in Amplitudes())
-            for (int block = 0; block < PulsesPerSite; block++)
-            {
-                int uv = (int)Math.Round(mv * 1000);
-                uint[] first = Shuffled(sites, rng);
-                if (!PairedTrials)
-                {
-                    foreach (uint site in first)
-                    {
-                        int stg = trials.Count % 2 == 0 ? 1 : 2;   // alternate the two outputs
-                        trials.Add(new List<Pulse> { new Pulse { Stg = stg, Electrode = site, OffsetMs = 0, AmplitudeUv = uv } });
-                    }
-                    continue;
-                }
-
-                uint[] second = Shuffled(sites, rng);
-                SeparatePairs(first, second, rng);
-                for (int i = 0; i < first.Length; i++)
-                {
-                    double delay = Stg2DelayMinMs + rng.NextDouble() * (Stg2DelayMaxMs - Stg2DelayMinMs);
-                    trials.Add(new List<Pulse>
-                    {
-                        new Pulse { Stg = 1, Electrode = first[i], OffsetMs = 0, AmplitudeUv = uv },
-                        new Pulse { Stg = 2, Electrode = second[i], OffsetMs = delay, AmplitudeUv = uv },
-                    });
-                }
-            }
-            return trials;
+            return seconds <= 0 ? !token.IsCancellationRequested : !token.WaitHandle.WaitOne(TimeSpan.FromSeconds(seconds));
         }
 
-        private static uint[] Shuffled(uint[] items, Random rng)
+        private string RunSession(uint[] sites, string basePath, CancellationToken token)
         {
-            uint[] a = (uint[])items.Clone();
-            for (int i = a.Length - 1; i > 0; i--)   // Fisher-Yates
-            {
-                int j = rng.Next(i + 1);
-                uint t = a[i]; a[i] = a[j]; a[j] = t;
-            }
-            return a;
-        }
-
-        // STG 1 and STG 2 must not stimulate the same electrode in one trial: swap within the block until they differ.
-        private static void SeparatePairs(uint[] first, uint[] second, Random rng)
-        {
-            for (int i = 0; i < second.Length; i++)
-            {
-                if (second[i] != first[i])
-                    continue;
-                foreach (int j in Enumerable.Range(0, second.Length).OrderBy(_ => rng.Next()))
-                {
-                    if (j != i && second[j] != first[i] && second[i] != first[j])
-                    {
-                        uint t = second[i]; second[i] = second[j]; second[j] = t;
-                        break;
-                    }
-                }
-                if (second[i] == first[i])
-                    throw new InvalidOperationException("Could not separate STG 1 and STG 2 sites.");
-            }
-        }
-
-        private string RunSession(uint[] sites, string logPath, CancellationToken token)
-        {
+            var inv = CultureInfo.InvariantCulture;
+            string logPath = basePath + ".stimlog.csv", notesPath = basePath + ".notes.yaml", h5Path = basePath + ".h5";
             int seed = FixedSeed ?? Environment.TickCount;
             var rng = new Random(seed);
-            List<List<Pulse>> trials = BuildSchedule(sites, rng);
-            string notesPath = logPath.Substring(0, logPath.Length - ".stimlog.csv".Length) + ".notes.yaml";
+            List<List<Delivery>> trials = StimulationEnabled
+                ? Schedule.Build(new ScheduleSettings
+                {
+                    Sites = sites, AmplitudesMv = Amplitudes(), Waveforms = Waveforms, TrialsPerCondition = TrialsPerCondition,
+                    Paired = PairedTrials, Stg2DelayMinMs = Stg2DelayMinMs, Stg2DelayMaxMs = Stg2DelayMaxMs,
+                }, rng)
+                : new List<List<Delivery>>();
             int done = 0;
             string error = null;
             var clock = Stopwatch.StartNew();
             var active = new List<uint>();
+            var sentS = new Dictionary<int, List<double>> { { 1, new List<double>() }, { 2, new List<double>() } };   // PC time of every pulse, per output
 
             CMcsUsbListNet cDeviceList = new CMcsUsbListNet(DeviceEnumNet.MCS_MEAUSB_DEVICE);
             if (cDeviceList.Count == 0)
                 return "No MEA USB device connected.";
             var deviceEntry = cDeviceList.GetUsbListEntry(0);
-            CStg200xDownloadNet cStgDevice = new CStg200xDownloadNet();
+            CStg200xDownloadNet cStgDevice = StimulationEnabled ? new CStg200xDownloadNet() : null;
+            Recorder recorder = null;
 
-            WriteNotes(notesPath, seed, sites, trials.Count);
-            using (var log = new StreamWriter(logPath, false, new UTF8Encoding(false)) { AutoFlush = true })
+            if (RecordToH5)
             {
-                log.WriteLine("trial,seq,stg,api_index,label,amplitude,unit,phase_us,offset_ms,interval_s,pc_time,pc_elapsed_s");
+                status = "Starting the recording...";
+                recorder = new Recorder();
                 try
                 {
+                    recorder.Start(deviceEntry, h5Path, SamplingRateHz, DeviceId, ScriptVersion, H5GzipLevel);
+                }
+                catch (Exception ex)
+                {
+                    recorder.Dispose();
+                    return "The recording could not be started; nothing was stimulated.\n\n" + ex.Message;
+                }
+                activeRecorder = recorder;
+            }
+
+            WriteNotes(notesPath, seed, sites, trials.Count, recorder);
+            StreamWriter log = null;
+            try
+            {
+                if (!StimulationEnabled)
+                {
+                    status = "Recording spontaneous activity (" + SpontaneousMinutes.ToString(inv) + " min). Stop ends it early.";
+                    Wait(SpontaneousMinutes * 60, token);
+                }
+                else
+                {
+                    log = new StreamWriter(logPath, false, new UTF8Encoding(false)) { AutoFlush = true };
+                    log.WriteLine("trial,seq,stg,api_index,label,amplitude,unit,phase_us,waveform,pulse,offset_ms,interval_s,pc_time,pc_elapsed_s");
+
                     cStgDevice.Connect(deviceEntry, 0);
                     cStgDevice.SetVoltageMode();
                     SetUpAllElectrodes(cStgDevice);   // same hardware settings on every electrode, all switched off
 
+                    bool go = true;
+                    if (recorder != null)
+                    {
+                        status = "Recording before stimulation (" + PreStimS.ToString(inv) + " s)...";
+                        go = Wait(PreStimS, token);
+                    }
+
                     int seq = 0;
                     double interval = 0;
-                    for (int t = 0; t < trials.Count && !token.IsCancellationRequested; t++)
+                    for (int t = 0; go && t < trials.Count && !token.IsCancellationRequested; t++)
                     {
+                        status = "Trial " + (t + 1).ToString(inv) + " of " + trials.Count.ToString(inv);
                         // Switch off the previous trial's electrodes, so they are not stimulated again.
                         foreach (uint e in active)
                             DisableElectrode(cStgDevice, e);
@@ -297,39 +345,55 @@ namespace MEA2100_Stimulation
 
                         double trialStart = clock.Elapsed.TotalSeconds;
                         SendTrial(cStgDevice, trials[t]);
-                        string pcTime = DateTime.Now.ToString("yyyy-MM-ddTHH:mm:ss.fff", CultureInfo.InvariantCulture);
+                        double sent = clock.Elapsed.TotalSeconds;   // just after the start command
+                        string pcTime = DateTime.Now.ToString("yyyy-MM-ddTHH:mm:ss.fff", inv);
 
-                        foreach (Pulse p in trials[t])
-                        {
-                            seq++;
-                            log.WriteLine(string.Join(",",
-                                (t + 1).ToString(CultureInfo.InvariantCulture),
-                                seq.ToString(CultureInfo.InvariantCulture),
-                                p.Stg.ToString(CultureInfo.InvariantCulture),
-                                p.Electrode.ToString(CultureInfo.InvariantCulture),
-                                IndexToLabel[p.Electrode],
-                                p.AmplitudeUv.ToString(CultureInfo.InvariantCulture),
-                                "uV",
-                                PhaseUs.ToString(CultureInfo.InvariantCulture),
-                                p.OffsetMs.ToString("F3", CultureInfo.InvariantCulture),
-                                interval.ToString("F3", CultureInfo.InvariantCulture),
-                                pcTime,
-                                trialStart.ToString("F4", CultureInfo.InvariantCulture)));
-                        }
+                        foreach (Delivery d in trials[t])
+                            for (int k = 0; k < d.Waveform.PulseCount; k++)
+                            {
+                                seq++;
+                                double offsetMs = (d.DelayUs + d.Waveform.PulseOffsetUs(k)) / 1000.0;
+                                sentS[d.Stg].Add(sent + offsetMs / 1000);
+                                log.WriteLine(string.Join(",",
+                                    (t + 1).ToString(inv),
+                                    seq.ToString(inv),
+                                    d.Stg.ToString(inv),
+                                    d.Electrode.ToString(inv),
+                                    IndexToLabel[d.Electrode],
+                                    d.AmplitudeUv.ToString(inv),
+                                    "uV",
+                                    d.Waveform.DurationsUs[0].ToString(inv),
+                                    d.Waveform.Name,
+                                    (k + 1).ToString(inv),
+                                    offsetMs.ToString("F3", inv),
+                                    interval.ToString("F3", inv),
+                                    pcTime,
+                                    sent.ToString("F4", inv)));
+                            }
                         done = t + 1;
 
                         // Random wait before the next trial, measured from this trial's start.
                         interval = IntervalMinS + rng.NextDouble() * (IntervalMaxS - IntervalMinS);
-                        double remaining = trialStart + interval - clock.Elapsed.TotalSeconds;
-                        if (remaining > 0 && token.WaitHandle.WaitOne(TimeSpan.FromSeconds(remaining)))
+                        if (!Wait(trialStart + interval - clock.Elapsed.TotalSeconds, token))
                             break;
                     }
+
+                    if (recorder != null)
+                    {
+                        // After a stop, still record 1 s so the last pulse is in the file.
+                        bool stopped = token.IsCancellationRequested;
+                        status = stopped ? "Stopping..." : "Recording after stimulation (" + PostStimS.ToString(inv) + " s)...";
+                        if (stopped) Thread.Sleep(1000); else Wait(PostStimS, token);
+                    }
                 }
-                catch (Exception ex)
-                {
-                    error = ex.Message;
-                }
-                finally
+            }
+            catch (Exception ex)
+            {
+                error = ex.Message;
+            }
+            finally
+            {
+                if (cStgDevice != null)
                 {
                     try
                     {
@@ -339,34 +403,71 @@ namespace MEA2100_Stimulation
                     catch { }
                     try { cStgDevice.Disconnect(); } catch { }
                 }
+                if (log != null)
+                    log.Dispose();
+            }
+
+            string recordingSummary = "";
+            if (recorder != null)
+            {
+                status = "Closing the recording...";
+                Recorder.Result result = null;
+                try
+                {
+                    result = recorder.Stop(sentS.ToDictionary(kv => kv.Key, kv => kv.Value.ToArray()));
+                }
+                catch (Exception ex)
+                {
+                    error = (error == null ? "" : error + "\n") + "closing the recording: " + ex.Message;
+                }
+                activeRecorder = null;
+                recorder.Dispose();
+                if (result != null)
+                {
+                    recordingSummary = RecordingSummary(result, sentS);
+                    AppendRecordingNotes(notesPath, result, sentS);
+                }
             }
 
             AppendNotesEnd(notesPath, done, error ?? (token.IsCancellationRequested ? "stopped by user" : "completed"));
-            string status = error != null ? "Error during stimulation:\n\n" + error + "\n\n" : "Stimulation finished.\n\n";
-            return status + done + " of " + trials.Count + " trials sent.\nLog: " + logPath;
+            string head = error != null ? "Error during the session:\n\n" + error + "\n\n" : "Session finished.\n\n";
+            return head + (StimulationEnabled ? done + " of " + trials.Count + " trials sent.\nLog: " + logPath + "\n" : "") + recordingSummary;
+        }
+
+        private static string RecordingSummary(Recorder.Result r, Dictionary<int, List<double>> sentS)
+        {
+            var inv = CultureInfo.InvariantCulture;
+            var sb = new StringBuilder();
+            sb.AppendLine("\nRecorded " + r.DurationS.ToString("F1", inv) + " s (" + r.Samples.ToString(inv) + " samples).");
+            foreach (SidebandDecoder.Pulses p in r.Pulses)
+            {
+                int n = sentS[p.Stg].Count;
+                if (n == 0)
+                    continue;
+                sb.AppendLine(p.Found
+                    ? "STG " + p.Stg + ": all " + n + " pulses found in the recording (word " + p.Word + ", bit " + p.Bit + "; timing within " + p.MaxResidualMs.ToString("F1", inv) + " ms)."
+                    : "STG " + p.Stg + ": the " + n + " pulses were NOT found in the sideband, so the file has NO events for this output. " +
+                      "The raw words are in /Sideband/Words; see the notes file.");
+            }
+            if (r.Errors.Length > 0)
+                sb.AppendLine(r.Errors.Length + " device/file errors (the recording may have gaps); first: " + r.Errors[0]);
+            return sb.ToString();
         }
 
         // Upload one trial to the STG and start it. Each output gets its own waveform and sideband;
         // only the outputs used in this trial are triggered.
-        private void SendTrial(CStg200xDownloadNet cStgDevice, List<Pulse> pulses)
+        private void SendTrial(CStg200xDownloadNet cStgDevice, List<Delivery> deliveries)
         {
             uint channelMap = 0;
-            foreach (Pulse p in pulses)
+            foreach (Delivery d in deliveries)
             {
-                uint channel = (uint)(p.Stg - 1);
-                ConfigureElectrode(cStgDevice, p.Electrode, p.Stg == 1 ? ElectrodeDacMuxEnumNet.Stg1 : ElectrodeDacMuxEnumNet.Stg2);
+                uint channel = (uint)(d.Stg - 1);
+                ConfigureElectrode(cStgDevice, d.Electrode, d.Stg == 1 ? ElectrodeDacMuxEnumNet.Stg1 : ElectrodeDacMuxEnumNet.Stg2);
 
-                ulong delayUs = (ulong)Math.Round(p.OffsetMs * 1000);
-                var amplitude = new List<int>();
-                var duration = new List<ulong>();
-                if (delayUs > 0)
-                {
-                    amplitude.Add(0);
-                    duration.Add(delayUs);
-                }
-                amplitude.AddRange(new[] { -p.AmplitudeUv, p.AmplitudeUv, 0 });
-                duration.AddRange(new[] { PhaseUs, PhaseUs, TailUs });
-                SendChannel(cStgDevice, channel, amplitude.ToArray(), duration.ToArray());
+                int[] amplitude, stimulusActive;
+                ulong[] duration;
+                Schedule.Expand(d, TailUs, out amplitude, out duration, out stimulusActive);
+                SendChannel(cStgDevice, channel, amplitude, duration, stimulusActive);
                 channelMap |= 1u << (int)channel;
             }
 
@@ -374,18 +475,16 @@ namespace MEA2100_Stimulation
             cStgDevice.SendStart(1);
         }
 
-        private void SendChannel(CStg200xDownloadNet cStgDevice, uint stgChannel, int[] amplitude, ulong[] duration)
+        // stimulusActive: 1 while a pulse is being delivered (including 0 V steps inside the pulse), else 0.
+        private void SendChannel(CStg200xDownloadNet cStgDevice, uint stgChannel, int[] amplitude, ulong[] duration, int[] stimulusActive)
         {
             uint Bit0Time = 40; // bit0 (blanking switch) activation duration prolongation in µs
             uint Bit3Time = 800; // bit3 (stimulation switch) activation duration prolongation in µs
             uint Bit4Time = 40; // bit4 (stimulus selection switch) activation duration prolongation in µs
 
-            // specify when stimulus is active
-            int[] stimulusActive = amplitude.Select(x => x == 0 ? 0 : 1).ToArray();
-
             // 0x40: Stimulus Active
             // 0x80: Marker (minimal length: 200us)
-            int[] sideband = amplitude.Select(x => x == 0 ? 0 : 0xc0).ToArray();
+            int[] sideband = stimulusActive.Select(x => x == 0 ? 0 : 0xc0).ToArray();
 
             cStgDevice.PrepareAndSendData(stgChannel, amplitude, duration, STG_DestinationEnumNet.channeldata_voltage);
 
@@ -422,7 +521,7 @@ namespace MEA2100_Stimulation
         }
 
         // Session description next to the log, written at the start. Culture and DIV are filled in by hand.
-        private static void WriteNotes(string path, int seed, uint[] sites, int nTrials)
+        private static void WriteNotes(string path, int seed, uint[] sites, int nTrials, Recorder recorder)
         {
             var inv = CultureInfo.InvariantCulture;
             var sb = new StringBuilder();
@@ -432,19 +531,51 @@ namespace MEA2100_Stimulation
             sb.AppendLine("device: " + DeviceId);
             sb.AppendLine("script_version: " + ScriptVersion);
             sb.AppendLine("started: " + DateTime.Now.ToString("yyyy-MM-ddTHH:mm:ss", inv));
-            sb.AppendLine("seed: " + seed.ToString(inv));
-            sb.AppendLine("mode: " + (PairedTrials ? "paired" : "single"));
-            sb.AppendLine("stimulation: {mode: voltage, amplitude_mv: [" + string.Join(", ", Amplitudes().Select(a => a.ToString(inv))) +
-                          "], phase_us: " + PhaseUs.ToString(inv) + ", shape: biphasic negative-first}");
-            sb.AppendLine("hardware_blanking: " + (HardwareBlanking ? "true" : "false"));
-            sb.AppendLine("amplifier_protection: " + (AmplifierProtection ? "true" : "false"));
-            sb.AppendLine("interval_s: [" + IntervalMinS.ToString(inv) + ", " + IntervalMaxS.ToString(inv) + "]");
-            if (PairedTrials)
-                sb.AppendLine("stg2_delay_ms: [" + Stg2DelayMinMs.ToString(inv) + ", " + Stg2DelayMaxMs.ToString(inv) + "]");
-            sb.AppendLine("pulses_per_site: " + PulsesPerSite.ToString(inv));
-            sb.AppendLine("sites: [" + string.Join(", ", sites.Select(s => IndexToLabel[s])) + "]");
-            sb.AppendLine("trials_planned: " + nTrials.ToString(inv));
+            if (recorder != null)
+                sb.AppendLine("recording: {file: \"" + Path.GetFileName(path).Replace(".notes.yaml", ".h5") + "\", sampling_rate_hz: " + SamplingRateHz.ToString(inv) +
+                              ", compressed: " + (recorder.Compressed ? "true" : "false") + ", pre_stim_s: " + PreStimS.ToString(inv) +
+                              ", post_stim_s: " + PostStimS.ToString(inv) + ", stream_layout: " + recorder.Layout + "}");
+            if (!StimulationEnabled)
+            {
+                sb.AppendLine("mode: spontaneous");
+                sb.AppendLine("planned_minutes: " + SpontaneousMinutes.ToString(inv));
+            }
+            else
+            {
+                sb.AppendLine("seed: " + seed.ToString(inv));
+                sb.AppendLine("mode: " + (PairedTrials ? "paired" : "single"));
+                sb.AppendLine("stimulation: {mode: voltage, amplitude_mv: [" + string.Join(", ", Amplitudes().Select(a => a.ToString(inv))) + "]}");
+                sb.AppendLine("waveforms:   # levels are fractions of the amplitude");
+                foreach (Waveform w in Waveforms)
+                    sb.AppendLine("  - " + w.Describe());
+                sb.AppendLine("hardware_blanking: " + (HardwareBlanking ? "true" : "false"));
+                sb.AppendLine("amplifier_protection: " + (AmplifierProtection ? "true" : "false"));
+                sb.AppendLine("interval_s: [" + IntervalMinS.ToString(inv) + ", " + IntervalMaxS.ToString(inv) + "]");
+                if (PairedTrials)
+                    sb.AppendLine("stg2_delay_ms: [" + Stg2DelayMinMs.ToString(inv) + ", " + Stg2DelayMaxMs.ToString(inv) + "]");
+                sb.AppendLine("trials_per_condition: " + TrialsPerCondition.ToString(inv));
+                sb.AppendLine("sites: [" + string.Join(", ", sites.Select(s => IndexToLabel[s])) + "]");
+                sb.AppendLine("trials_planned: " + nTrials.ToString(inv));
+            }
             File.WriteAllText(path, sb.ToString(), new UTF8Encoding(false));
+        }
+
+        // What the recording contains and how the pulses were found in it.
+        private static void AppendRecordingNotes(string path, Recorder.Result r, Dictionary<int, List<double>> sentS)
+        {
+            var inv = CultureInfo.InvariantCulture;
+            var sb = new StringBuilder();
+            sb.AppendLine("recorded_s: " + r.DurationS.ToString("F3", inv));
+            sb.AppendLine("recorded_samples: " + r.Samples.ToString(inv));
+            foreach (SidebandDecoder.Pulses p in r.Pulses)
+                if (sentS[p.Stg].Count > 0)
+                    sb.AppendLine("stg" + p.Stg + "_events: {pulses_sent: " + sentS[p.Stg].Count.ToString(inv) + ", found: " + (p.Found ? "true" : "false") +
+                                  (p.Found ? ", word: " + p.Word.ToString(inv) + ", bit: " + p.Bit.ToString(inv) + ", max_residual_ms: " + p.MaxResidualMs.ToString("F2", inv) : "") +
+                                  ", candidate_bits: " + p.Candidates.ToString(inv) + "}");
+            sb.AppendLine("sideband_words: |");
+            sb.Append(string.IsNullOrEmpty(r.SidebandReport) ? "  (none)" + Environment.NewLine : r.SidebandReport);
+            sb.AppendLine("recording_errors: [" + string.Join(", ", r.Errors.Select(e => "\"" + e.Replace("\"", "'").Replace("\r", " ").Replace("\n", " ") + "\"")) + "]");
+            File.AppendAllText(path, sb.ToString(), new UTF8Encoding(false));
         }
 
         // Appended at the end, so anything typed into the notes during the session is kept.
@@ -452,9 +583,9 @@ namespace MEA2100_Stimulation
         {
             var inv = CultureInfo.InvariantCulture;
             File.AppendAllText(path,
-                "trials_sent: " + done.ToString(inv) + Environment.NewLine +
+                (StimulationEnabled ? "trials_sent: " + done.ToString(inv) + Environment.NewLine : "") +
                 "ended: " + DateTime.Now.ToString("yyyy-MM-ddTHH:mm:ss", inv) + Environment.NewLine +
-                "status: \"" + status.Replace("\"", "'") + "\"" + Environment.NewLine,
+                "status: \"" + status.Replace("\"", "'").Replace("\r", " ").Replace("\n", " ") + "\"" + Environment.NewLine,
                 new UTF8Encoding(false));
         }
     }
