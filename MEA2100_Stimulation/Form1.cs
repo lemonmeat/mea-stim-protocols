@@ -64,8 +64,10 @@ namespace MEA2100_Stimulation
         private const double MaxAmplitudeMv = 1000;    // safety cap: refuse to start above this
         private const ulong TailUs = 1000;             // zero output after the last pulse, before the trial's data ends
 
-        // Amplitude sweep: null = off. Otherwise every condition is run at each amplitude, lowest first,
+        // Amplitude sweep: null = off. Otherwise every condition is run at each amplitude, with the
+        // amplitudes interleaved among sites and waveforms in random order (Schedule.cs),
         // e.g. new double[] { 100, 250, 500, 1000 } with a few sites and TrialsPerCondition = 10.
+        // The highest amplitude can come first: list only amplitudes the culture is known to tolerate.
         private static readonly double[] AmplitudeSweepMv = null;
 
         // Hardware settings, applied to ALL electrodes at the start, so the recording behaves the same
@@ -86,7 +88,7 @@ namespace MEA2100_Stimulation
 
         private static readonly int? FixedSeed = null; // null: a new seed each session (it is logged); set a number to repeat a schedule
         private const string DeviceId = "E-00278";     // device used; E-00278, E-00281 and E-00303 share the wiring
-        private const string ScriptVersion = "waveforms-h5-1";
+        private const string ScriptVersion = "random-amplitude-sweep-1";
 
         // -----------------------------------------------------------------------------
 
@@ -235,7 +237,8 @@ namespace MEA2100_Stimulation
                 throw new ArgumentException("IntervalMinS is shorter than the longest trial (" + trialMs.ToString("F0", inv) + " ms) plus 50 ms.");
         }
 
-        // The amplitudes of this session, in mV: the sweep if set, else the one amplitude.
+        // The amplitudes of this session, in mV: the sweep if set, else the one amplitude. Sorted for the
+        // start dialog and the notes only; the schedule interleaves them in random order.
         private static double[] Amplitudes()
         {
             return AmplitudeSweepMv != null ? AmplitudeSweepMv.OrderBy(a => a).ToArray() : new[] { AmplitudeMv };
@@ -544,7 +547,7 @@ namespace MEA2100_Stimulation
             {
                 sb.AppendLine("seed: " + seed.ToString(inv));
                 sb.AppendLine("mode: " + (PairedTrials ? "paired" : "single"));
-                sb.AppendLine("stimulation: {mode: voltage, amplitude_mv: [" + string.Join(", ", Amplitudes().Select(a => a.ToString(inv))) + "]}");
+                sb.AppendLine("stimulation: {mode: voltage, amplitude_mv: [" + string.Join(", ", Amplitudes().Select(a => a.ToString(inv))) + "], amplitude_order: interleaved}");
                 sb.AppendLine("waveforms:   # levels are fractions of the amplitude");
                 foreach (Waveform w in Waveforms)
                     sb.AppendLine("  - " + w.Describe());

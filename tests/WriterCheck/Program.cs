@@ -55,7 +55,11 @@ static class Program
         List<List<Delivery>> trials = Schedule.Build(settings, new Random(1));
         Expect(trials.Count == 4 * 2 * 3 * 2, "single mode: sites x amplitudes x waveforms x repeats trials");
         Expect(trials.SelectMany(t => t).GroupBy(d => d.Electrode + "/" + d.Waveform.Name + "/" + d.AmplitudeUv).All(g => g.Count() == 2), "every condition has the same number of trials");
-        Expect(trials.Take(24).All(t => t[0].AmplitudeUv == 100000) && trials.Skip(24).All(t => t[0].AmplitudeUv == 500000), "lowest amplitude first");
+        Func<List<Delivery>, string> condition = t => t[0].Electrode + "/" + t[0].Waveform.Name + "/" + t[0].AmplitudeUv;
+        Expect(trials.Take(24).Select(condition).Distinct().Count() == 24 && trials.Skip(24).Select(condition).Distinct().Count() == 24,
+               "each block holds every site x waveform x amplitude once");
+        Expect(trials.Take(12).Select(t => t[0].AmplitudeUv).Distinct().Count() == 2 && trials.Skip(12).Take(12).Select(t => t[0].AmplitudeUv).Distinct().Count() == 2,
+               "amplitudes are interleaved, not run one after the other");
         Expect(trials.Select((t, i) => t[0].Stg == i % 2 + 1).All(x => x), "outputs alternate");
 
         settings.Paired = true;
@@ -63,6 +67,8 @@ static class Program
         Expect(paired.All(t => t.Count == 2 && t[0].Electrode != t[1].Electrode), "paired mode: two different electrodes per trial");
         Expect(paired.All(t => t[1].DelayUs % 20 == 0 && t[1].DelayUs >= 100000 && t[1].DelayUs <= 300000), "paired mode: STG 2 delay in range, on the 20 us grid");
         Expect(paired.SelectMany(t => t).GroupBy(d => d.Stg + "/" + d.Electrode).All(g => g.Count() == 12), "paired mode: every site equally often on each output");
+        Expect(paired.All(t => t[0].AmplitudeUv == t[1].AmplitudeUv && t[0].Waveform == t[1].Waveform), "paired mode: both outputs use the trial's amplitude and waveform");
+        Expect(paired.SelectMany(t => t).GroupBy(d => d.Stg + "/" + d.AmplitudeUv).All(g => g.Count() == 24), "paired mode: every amplitude equally often on each output");
 
         int[] amp, act; ulong[] dur;
         Schedule.Expand(new Delivery { Stg = 2, Electrode = 1, DelayUs = 1000, AmplitudeUv = 500000, Waveform = gap }, 1000, out amp, out dur, out act);

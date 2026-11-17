@@ -2,11 +2,11 @@
 
 Stimulation scripts for recording sessions on the MCS MEA2100-Mini with the 3D-MIND array. A temporary tool: it exists to collect better test recordings until the lab's closed-loop testing suite replaces it.
 
-**Status (branch `custom-waveforms-h5-recording`, version `waveforms-h5-1`):** adds custom waveforms and the program's own recording straight to `.h5`.
+**Status (branch `random-amplitude-sweep`, version `random-amplitude-sweep-1`):** the amplitude sweep now interleaves amplitudes with sites and waveforms in random order, instead of running them one after the other, lowest first. Everything else is as in `custom-waveforms-h5-recording` (`waveforms-h5-1`), which added custom waveforms and the program's own recording straight to `.h5`.
 
-- The code compiles for .NET Framework 4.7.2 against `McsUsbNet.dll`.
+- **Rebuild in Visual Studio before a session.** The `.exe` in `bin/` was built from `waveforms-h5-1` and does not contain this change.
 - The waveform, schedule, pulse-finding and HDF5 code is tested without hardware (`tests/`), and the analysis package reads the file it writes.
-- **Nothing on this branch has been run on the MEA2100 yet.** The recording part makes assumptions about the device's data stream that only a test can settle. Do "First test on the hardware" below before trusting a recording.
+- `waveforms-h5-1` recorded the 2026-11-10 and 2026-11-12 sessions on the MEA2100: all pulses were found, and meagraph reads the files. This branch changes only the order of the trials. Do "First test on the hardware" below before trusting a recording from a new set-up.
 
 ## Running a session
 
@@ -16,7 +16,7 @@ Stimulation scripts for recording sessions on the MCS MEA2100-Mini with the 3D-M
    - `Waveforms`: the waveforms to test (see below);
    - `TrialsPerCondition`, `PairedTrials`, `IntervalMinS`/`IntervalMaxS`;
    - `AmplitudeMv` (what a waveform level of 1 means, in **mV**; capped by `MaxAmplitudeMv`);
-   - `AmplitudeSweepMv` (optional: test several amplitudes, lowest first);
+   - `AmplitudeSweepMv` (optional: test several amplitudes, interleaved in random order);
    - `HardwareBlanking`, `AmplifierProtection` (applied to all 60 electrodes at the start);
    - `RecordToH5`, `SamplingRateHz`, `PreStimS`, `PostStimS`, `H5GzipLevel`;
    - `FixedSeed`, `DeviceId`.
@@ -30,7 +30,13 @@ A session writes `<name>.stimlog.csv`, `<name>.notes.yaml` and, with `RecordToH5
 - **Single** (default): one electrode per trial, alternating STG 1 and STG 2.
 - **Paired:** STG 1 and STG 2 stimulate two different electrodes in the same trial with the same waveform, STG 2 after a random 100–300 ms delay. The script never puts the same electrode on both outputs in one trial.
 
-**Schedule:** for each amplitude (lowest first) there are `TrialsPerCondition` blocks. A block contains every (site, waveform) combination once, in a new random order. So waveforms and sites are interleaved, and every combination gets the same number of trials. The number of trials is sites × waveforms × amplitudes × `TrialsPerCondition`. Before each trial, the previous trial's electrodes are switched off, so only the logged electrodes are stimulated.
+**Schedule:** there are `TrialsPerCondition` blocks. A block contains every (site, waveform, amplitude) combination once, in a new random order. So sites, waveforms and amplitudes are interleaved, and every combination gets the same number of trials. The number of trials is sites × waveforms × amplitudes × `TrialsPerCondition`.
+- Amplitudes are not run one after the other, because the culture changes during a session: active and silent periods, drift, and effects of the stimulation itself. Interleaved, these changes fall on every amplitude alike. Run one after the other, they would look like an effect of amplitude.
+- The highest amplitude can come first, so list only amplitudes the culture is known to tolerate (`MaxAmplitudeMv` still caps them).
+- In paired mode, both outputs use the trial's waveform and amplitude.
+- `notes.yaml` records `amplitude_order: interleaved`. Sessions from earlier versions ran amplitudes lowest first.
+
+Before each trial, the previous trial's electrodes are switched off, so only the logged electrodes are stimulated. Before each trial, the previous trial's electrodes are switched off, so only the logged electrodes are stimulated.
 
 ## Waveforms
 
